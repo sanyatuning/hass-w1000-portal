@@ -20,14 +20,15 @@ def resp_file(name):
 
 
 testdata = [
-    ("good", 14293.749, 14326.234),
-    ("missing_start", None, 14172.722),
-    ("missing_last", None, None),
+    ("dst", 17009.72, 17051.099, "2024-09-13T22:00:00+00:00"),
+    ("good", 14293.749, 14326.234, "2024-03-08T23:00:00+00:00"),
+    ("missing_start", None, 14172.722, None),
+    ("missing_last", None, None, None),
 ]
 
 
-@pytest.mark.parametrize("name,first,last", testdata)
-async def test_w1k_api(name, first, last, aiohttp_client, hass):
+@pytest.mark.parametrize("name,first,last,start", testdata)
+async def test_w1k_api(name, first, last, start, aiohttp_client, hass):
     """Test entry setup and unload."""
     enable_socket()
 
@@ -58,6 +59,9 @@ async def test_w1k_api(name, first, last, aiohttp_client, hass):
     if first is None:
         mock_recorder.async_import_statistics.assert_not_called()
     else:
-        for stat in mock_recorder.async_import_statistics.call_args.args[1]:
+        statistics = mock_recorder.async_import_statistics.call_args.args[1]
+        assert statistics[0].get("start").isoformat() == start
+
+        for stat in statistics:
             assert stat.get("state") >= first
             assert stat.get("state") <= last

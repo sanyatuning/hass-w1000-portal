@@ -11,23 +11,19 @@ import aiohttp
 import voluptuous as vol
 import unicodedata
 
-from homeassistant.core import callback, HomeAssistant
 from homeassistant.helpers import discovery
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.event import async_track_utc_time_change
-from homeassistant.const import (
-    CONF_SCAN_INTERVAL,
-)
 import homeassistant.util.dt as dt_util
 
 from bs4 import BeautifulSoup
-import requests, yaml, re
-from datetime import datetime, timedelta, timezone
+import yaml
+import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 from homeassistant.components.recorder.statistics import (
-    async_add_external_statistics,
-    get_last_statistics,
     async_import_statistics
 )
 import json
@@ -96,9 +92,8 @@ class w1k_API:
         ret = {}
         for report in self.reports:
             _LOGGER.debug("reading report "+report)
-            retitem = await self.read_reportname(report)
-            ret[report] = retitem[0]
-        
+            ret[report] = await self.read_reportname(report)
+
         return ret
         
     def mysession(self):
@@ -129,8 +124,9 @@ class w1k_API:
             }
             
             header = {}
-#            header["User-Agent"] =  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/106.0.0.0 Safari/537.36"
-#            header["Referer"] = self.account_url
+            # header["User-Agent"] = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            #                         "Chrome/106.0.0.0 Safari/537.36")
+            # header["Referer"] = self.account_url
 
             async with session.post(
                 url=self.account_url, data=payload, ssl=ssl
@@ -174,7 +170,7 @@ class w1k_API:
             loginerror = not await self.login()
         
         if loginerror:
-            return [None]
+            return None
         
         for workarea in self.workareas:
             for window in workarea['windows']:
@@ -182,11 +178,10 @@ class w1k_API:
                     return await self.read_reportid(int(window['reportid']), reportname)
         
         _LOGGER.error("report "+reportname+" not found")
-        return [None]
+        return None
 
     async def read_reportid(self, reportid: int, reportname: str, ssl=True):
         now = datetime.utcnow()
-        hass = self._hass
 
         loginerror = False
         if not self.lastlogin or self.lastlogin + timedelta(hours=1) < datetime.utcnow():
@@ -224,29 +219,27 @@ class w1k_API:
                 jsonResponse = sorted(jsonResponse, key=lambda k: k['name'], reverse=True)
             status = resp.status
 
-            if status == 200 and test:
+            if status == 200:
                 with open(file, 'w', encoding='utf-8') as f:
                     json.dump(jsonResponse, f, ensure_ascii=True, indent=4)
                 _LOGGER.debug(file+' saved')
 
+        ret = None
         if status == 200:
-            unit = None
             lasttime = None
             lastvalue = None
-            ret = []
             sensorname = f'sensor.w1000_'+(
                 ''.join(ch for ch in unicodedata.normalize('NFKD', reportname) if not unicodedata.combining(ch)))
             statistic_id = sensorname
             statistics = []
-            metadata = []
             haveReport_A = False
             for curve in jsonResponse:
-                unit = curve['unit']
                 name = curve['name']
                 hourly_sum = None
                 for data in curve['data']:
                     value = data['value']
-                    dt = datetime.fromisoformat(data['time']+"+02:00").astimezone()  # TODO: needs to calculate DST
+                    dt = datetime.fromisoformat(data['time']).replace(tzinfo=ZoneInfo("Europe/Budapest"))
+
                     if curve['data'].index(data) == 0:  # first element in list will be the starting data
                         if '1.8.0' in name and value > 0:
                             self.start_values['consumption'] = value
@@ -263,7 +256,9 @@ class w1k_API:
                                 dailycurve = '2.8.0'
                                 hourly_sum = self.start_values['production']
                             if hourly_sum is None:
-                                _LOGGER.warning(f"{dailycurve} curve is missing. Please add it to your report '{reportname}'")
+                                _LOGGER.warning(
+                                    f"{dailycurve} curve is missing. Please add it to your report '{reportname}'"
+                                )
                             if curve['period'] != 60:
                                 _LOGGER.warning('Please set the period value to 60 min in curve settings')
                     if haveReport_A:
@@ -277,7 +272,7 @@ class w1k_API:
                                     sum=round(hourly_sum, 3)
                                 )
                             )
-                            if lasttime and ( data['time'] > lasttime ) :
+                            if lasttime and (data['time'] > lasttime):
                                 lasttime = data['time']
                                 lastvalue = round(hourly_sum, 3)
                     else:
@@ -302,12 +297,13 @@ class w1k_API:
                     except Exception as ex:
                         _LOGGER.exception("exception at async_import_statistics '"+statistic_id+"': "+str(ex))
 
-                ret.append({
-                    'curve': curve['name'],
-                    'last_value': lastvalue,
-                    'unit': curve['unit'],
-                    'last_time': lasttime
-                })
+                if ret is None or ret['last_time'] is None or ret['last_time'] < lasttime:
+                    ret = {
+                        'curve': curve['name'],
+                        'last_value': lastvalue,
+                        'unit': curve['unit'],
+                        'last_time': lasttime
+                    }
 
         else:
             _LOGGER.error("error http "+str(status))
@@ -336,15 +332,9 @@ class w1k_Portal(w1k_API):
         for report in json:
             dta = json[report]
             if dta and 'curve' in dta:
-                if '.8.' in dta['curve']:
-                    state_class = 'total_increasing'
-                else:
-                    state_class = 'total'
-                
                 out[report] = {
                     'state': dta['last_value'],
                     'unit': dta['unit'],
-                    'state_class': state_class,
                     'attributes': {
                         'curve': dta['curve'],
                         'generated': dta['last_time'],
@@ -352,8 +342,10 @@ class w1k_Portal(w1k_API):
                 }
                 if dta['unit'].endswith('W') or dta['unit'].endswith('Var'):
                     out[report]['device_class'] = 'power'
+                    out[report]['state_class'] = 'measurement'
                 if dta['unit'].endswith('Wh') or dta['unit'].endswith('Varh'):
                     out[report]['device_class'] = 'energy'
+                    out[report]['state_class'] = 'total_increasing'
 
         return out
 
